@@ -200,8 +200,7 @@ def run_analysis(resume_text: str, job_description: str) -> AnalysisResult:
                     },
                 ],
             }
-        ],
-        betas=["prompt-caching-2024-07-31"],
+        ]
     )
 
     tool_block = next(b for b in response.content if b.type == "tool_use")

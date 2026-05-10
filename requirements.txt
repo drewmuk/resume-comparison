@@ -8,3 +8,9 @@ pydantic>=2.5.0
 rich>=13.7.0
 typer>=0.9.0
 python-dotenv>=1.0.0
+# notebook UI
+ipywidgets>=8.0.0
+notebook>=7.0.0
+# browser-based scraping fallback (optional but recommended)
+# after pip install, run: playwright install chromium
+playwright>=1.40.0

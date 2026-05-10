@@ -2,6 +2,8 @@
 Rich terminal rendering for analysis results and iteration comparisons.
 """
 
+from pathlib import Path
+
 from rich.columns import Columns
 from rich.console import Console
 from rich.panel import Panel

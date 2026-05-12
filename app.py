@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -8,6 +9,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from analyzer import run_analysis
+from job_finder import (
+    JobListing,
+    ScreenedJob,
+    SearchTerms,
+    extract_terms_claude,
+    extract_terms_heuristic,
+    screen_jobs_batch,
+    search_jobs,
+)
 from models import AnalysisResult
 from parsers import parse_resume
 from scraper import scrape_job_posting
@@ -282,9 +292,12 @@ def show_comparison(sess: dict) -> None:
 
 # ── session state init ────────────────────────────────────────────────────────
 
-for _key in ("result_tab1", "result_tab2", "session_tab2"):
+for _key in ("result_tab1", "result_tab2", "session_tab2", "found_jobs", "search_terms"):
     if _key not in st.session_state:
         st.session_state[_key] = None
+
+if "full_analyses" not in st.session_state:
+    st.session_state.full_analyses = {}   # keyed by job URL
 
 # ── header ────────────────────────────────────────────────────────────────────
 
@@ -306,7 +319,7 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
 
 # ── tabs ──────────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3 = st.tabs(["🔍 Analyze", "🔄 Iterate", "📊 History & Compare"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 Analyze", "🔄 Iterate", "📊 History & Compare", "🔎 Find Jobs"])
 
 # ── Tab 1: Analyze ────────────────────────────────────────────────────────────
 
@@ -516,3 +529,204 @@ with tab3:
                     from models import AnalysisResult as AR
                     chosen_data = iter_options[chosen_label]["result"]
                     show_analysis(AR(**chosen_data))
+
+# ── Tab 4: Find Jobs ──────────────────────────────────────────────────────────
+
+with tab4:
+    st.markdown(
+        "Upload your resume and optionally specify a location or custom search terms. "
+        "Jobs are pulled from **The Muse** and **Remotive** — individual postings with "
+        "full descriptions, not search-result index pages."
+    )
+    st.caption(
+        "API cost: ~1 screening call regardless of how many jobs are found. "
+        "Full analysis is only triggered when you click it on a specific job. "
+        "LinkedIn requires login (not supported). Workday is not supported — paste descriptions manually on the Analyze tab."
+    )
+    st.divider()
+
+    left4, right4 = st.columns([1, 2], gap="large")
+
+    with left4:
+        st.subheader("Inputs")
+
+        resume4 = st.file_uploader(
+            "Resume (.pdf or .docx)", type=["pdf", "docx"], key="up4"
+        )
+        location4 = st.text_input(
+            "Location  *(optional)*",
+            placeholder="e.g. New York, remote, San Francisco",
+        )
+        custom_terms = st.text_area(
+            "Custom search terms  *(optional)*",
+            placeholder=(
+                "Leave blank to auto-extract from resume.\n"
+                "Or specify, e.g.:\n"
+                "  job titles: data engineer, analytics engineer\n"
+                "  skills: dbt, Snowflake, Python"
+            ),
+            height=110,
+        )
+        max_results = st.slider("Max jobs to find", min_value=5, max_value=20, value=10)
+        smart_extract = st.toggle(
+            "Smart term extraction  *(+1 Haiku API call, better accuracy)*",
+            value=False,
+            help=(
+                "Off: extract search terms from your resume using regex — fast and free.\n"
+                "On: use Claude Haiku to extract more targeted terms — costs ~500 extra tokens."
+            ),
+        )
+
+        find_btn = st.button(
+            "🔎  Find & Rank Jobs", type="primary", use_container_width=True,
+            disabled=not resume4,
+        )
+
+    with right4:
+        if find_btn and resume4:
+            # ── parse resume ──────────────────────────────────────────────
+            with st.spinner("Parsing resume…"):
+                tmp4, _ = _save_upload(resume4)
+                try:
+                    resume_text4 = parse_resume(tmp4)
+                except ValueError as e:
+                    st.error(str(e))
+                    st.stop()
+                finally:
+                    os.unlink(tmp4)
+
+            # ── extract search terms ──────────────────────────────────────
+            if custom_terms.strip():
+                # Build SearchTerms from the user's freeform text
+                titles_match = re.search(r"job titles?[:\s]+(.+)", custom_terms, re.I)
+                skills_match = re.search(r"skills?[:\s]+(.+)", custom_terms, re.I)
+                raw_titles = [t.strip() for t in titles_match.group(1).split(",")] if titles_match else []
+                raw_skills = [s.strip() for s in skills_match.group(1).split(",")] if skills_match else []
+                # Fall back to treating the whole textarea as a list of terms
+                if not raw_titles and not raw_skills:
+                    all_terms = [t.strip() for t in re.split(r"[,\n]", custom_terms) if t.strip()]
+                    raw_titles = all_terms[:3]
+                    raw_skills = all_terms[3:9]
+                terms4 = SearchTerms(job_titles=raw_titles or ["Software Engineer"], key_skills=raw_skills)
+                st.info(f"Using your terms: **{', '.join(terms4.job_titles)}** + skills: {', '.join(terms4.key_skills)}")
+            elif smart_extract:
+                with st.spinner("Extracting search terms with Claude Haiku…"):
+                    try:
+                        terms4 = extract_terms_claude(resume_text4)
+                    except Exception as e:
+                        st.warning(f"Smart extraction failed ({e}), falling back to heuristic.")
+                        terms4 = extract_terms_heuristic(resume_text4)
+            else:
+                terms4 = extract_terms_heuristic(resume_text4)
+
+            # Show extracted terms so the user can see what's being searched
+            with st.expander("🔍 Search terms being used", expanded=False):
+                st.markdown(f"**Job titles:** {', '.join(terms4.job_titles) or '—'}")
+                st.markdown(f"**Key skills:** {', '.join(terms4.key_skills) or '—'}")
+                if terms4.seniority:
+                    st.markdown(f"**Seniority:** {terms4.seniority}")
+                if location4.strip():
+                    st.markdown(f"**Location:** {location4.strip()}")
+
+            # ── web search ────────────────────────────────────────────────
+            with st.spinner("Searching job boards (The Muse + Remotive)…"):
+                try:
+                    jobs4 = search_jobs(
+                        terms4,
+                        location=location4.strip() or None,
+                        max_results=max_results,
+                    )
+                except RuntimeError as e:
+                    st.error(str(e))
+                    st.stop()
+
+            if not jobs4:
+                st.warning(
+                    "No job postings found. Try different search terms or check your internet connection."
+                )
+                st.stop()
+
+            st.info(f"Found **{len(jobs4)}** job postings. Screening with Claude…")
+
+            # ── batch screening (1 API call) ──────────────────────────────
+            with st.spinner("Batch screening all jobs in one API call…"):
+                try:
+                    screened4 = screen_jobs_batch(resume_text4, jobs4)
+                except Exception as e:
+                    st.error(f"Screening failed: {e}")
+                    st.stop()
+
+            st.session_state.found_jobs = screened4
+            st.session_state["_resume_text4"] = resume_text4   # keep for full analyses
+
+        # ── results ───────────────────────────────────────────────────────
+        if st.session_state.found_jobs:
+            screened = st.session_state.found_jobs
+            resume_text_cached = st.session_state.get("_resume_text4", "")
+
+            rec_colors = {"strong": "#1e8449", "moderate": "#d35400", "skip": "#888"}
+            rec_labels = {"strong": "✅ STRONG FIT", "moderate": "⚠ MODERATE FIT", "skip": "✗ SKIP"}
+
+            st.subheader(f"Results — {len(screened)} jobs ranked by fit")
+
+            for job_result in screened:
+                job = job_result.listing
+                rec = job_result.apply_recommendation
+                score = job_result.overall_score
+                sc = _score_color(score)
+                rc = rec_colors.get(rec, "#888")
+
+                with st.container(border=True):
+                    top_left, top_right = st.columns([3, 1])
+                    with top_left:
+                        st.markdown(
+                            f"### [{job.title}]({job.url})\n"
+                            f"**{job.company}** &nbsp;·&nbsp; "
+                            f'<span style="color:{sc};font-weight:700;font-size:16px">{score}%</span> &nbsp;·&nbsp; '
+                            f'<span style="background:{rc};color:white;padding:2px 8px;border-radius:8px;font-size:12px;font-weight:600">{rec_labels.get(rec, rec)}</span>',
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(job_result.one_line_summary)
+
+                    with top_right:
+                        st.markdown(_score_bar_html(score, 120), unsafe_allow_html=True)
+                        st.markdown(
+                            f'<a href="{job.url}" target="_blank" style="font-size:12px">Open posting ↗</a>',
+                            unsafe_allow_html=True,
+                        )
+
+                    detail_col, action_col = st.columns([3, 1])
+                    with detail_col:
+                        if job_result.top_matches:
+                            st.markdown(
+                                "**Matches:** " + "  ".join(_pill(m, "#1e8449") for m in job_result.top_matches),
+                                unsafe_allow_html=True,
+                            )
+                        if job_result.critical_gaps:
+                            st.markdown(
+                                "**Gaps:** " + "  ".join(_pill(g, "#c0392b") for g in job_result.critical_gaps),
+                                unsafe_allow_html=True,
+                            )
+
+                    with action_col:
+                        already_analyzed = job.url in st.session_state.full_analyses
+                        btn_label = "✓ Analysis done" if already_analyzed else "Run Full Analysis"
+                        if st.button(btn_label, key=f"full_{job.index}", disabled=already_analyzed):
+                            st.session_state[f"_run_full_{job.url}"] = True
+
+                    # Trigger full analysis if button was just clicked
+                    if st.session_state.get(f"_run_full_{job.url}") and job.url not in st.session_state.full_analyses:
+                        with st.spinner(f"Fetching full job description and analyzing…"):
+                            try:
+                                full_desc = scrape_job_posting(job.url)
+                            except RuntimeError:
+                                full_desc = job.description  # fall back to snippet
+                            try:
+                                full_result = run_analysis(resume_text_cached, full_desc)
+                                st.session_state.full_analyses[job.url] = full_result
+                            except Exception as e:
+                                st.error(f"Full analysis failed: {e}")
+
+                    if job.url in st.session_state.full_analyses:
+                        with st.expander("📋 Full Analysis", expanded=True):
+                            show_analysis(st.session_state.full_analyses[job.url])
